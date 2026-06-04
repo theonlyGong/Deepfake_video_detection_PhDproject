@@ -1,0 +1,53 @@
+# Deepfake Video Detection Project Requirements
+# Generated on 2026-06-04
+#
+# 安装方法：
+# 方法1：使用pip直接安装（自动使用清华源）
+#   pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+#
+# 方法2：配置默认清华源后安装
+#   pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple
+#   pip install -r requirements.txt
+#
+# 方法3：使用项目提供的 install.bat (Windows) 或 install.sh (Linux/Mac)
+#
+# ============================================
+
+# Core Deep Learning Framework
+--index-url https://pypi.tuna.tsinghua.edu.cn/simple
+--trusted-host pypi.tuna.tsinghua.edu.cn
+
+torch>=1.12.0
+torchvision>=0.13.0
+
+# Computer Vision
+opencv-python>=4.6.0
+opencv-contrib-python>=4.6.0
+
+# Image Augmentation
+albumentations>=1.3.0
+
+# Video Processing
+decord>=0.6.0
+
+# Scientific Computing
+numpy>=1.21.0
+
+# Image Processing
+Pillow>=9.0.0
+
+# Machine Learning Utilities
+scikit-learn>=1.0.0
+
+# Logging
+loguru>=0.6.0
+
+# Visualization (optional, used for debugging/display)
+matplotlib>=3.5.0
+
+# ONNX Runtime (for face detection model inference)
+onnxruntime>=1.12.0
+onnxruntime-gpu>=1.12.0; sys_platform != 'darwin'  # Mac不提供GPU版本
+
+# Utilities
+tqdm>=4.64.0

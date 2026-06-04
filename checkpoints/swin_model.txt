@@ -1,0 +1,1 @@
+请自行去官网下载文件：swin_tiny_patch4_window7_224_22k.pth
