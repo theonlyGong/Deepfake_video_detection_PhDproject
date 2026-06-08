@@ -62,11 +62,11 @@
 ```python
 # 计算8帧特征向量的余弦相似度
 # 目标：真实视频帧间相似度高（特征一致）
-#       伪造视频帧间相似度低（特征分散）
+#       伪造视频帧间相似度高（特征一致）
 
 for feat_i, feat_j in combinations(features, 2):
     cos_sim = cosine_similarity(feat_i, feat_j)
-    loss += 1 - cos_sim  # 让特征更分散
+    loss += 1 - cos_sim  
 
 L_con = mean(all_pairs)
 ```
