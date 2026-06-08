@@ -16,7 +16,7 @@ from dataset import Deepfake_Dataset
 from data_aug import get_aug
 from backbones.model import swin_tiny_patch4_window7_224 as create_model
 from loss import *
-from adaptive_loss import AdaptiveLossWeight
+from adaptive_loss import AdaptiveLossWeight, SimpleLearnableWeight, ConstrainedWeight
 from sklearn.metrics import roc_auc_score, roc_curve, auc as sklearn_auc
 from loguru import logger
 
@@ -101,7 +101,9 @@ if __name__ == '__main__':
     parser.add_argument('--adaptive-weight', type=bool, default=True,
                         help='是否使用自适应损失权重 (默认True)')
     parser.add_argument("--epochs", type=int, default=40)
-    parser.add_argument('--lr', type=float, default=0.0001)
+    parser.add_argument('--lr', type=float, default=0.001)
+    parser.add_argument('--weight_decay', type=float, default=1e-2, help='weight decay for optimizer')
+    parser.add_argument('--scheduler', type=str, default='cosine', choices=['cosine', 'step', 'plateau', 'none'], help='learning rate scheduler')
     parser.add_argument('--device', type=str, default='auto',
                         choices=['auto', 'cuda', 'cpu'], help='Device to use for training (auto/cuda/cpu)')
     parser.add_argument('--gpu-id', type=int, default=7,
@@ -157,36 +159,61 @@ if __name__ == '__main__':
 
     # 如果使用自适应权重，添加权重参数到优化器
     if args.adaptive_weight:
-        loss_weight = AdaptiveLossWeight(num_losses=2).to(device)
+        # 使用 ConstrainedWeight：单个可学习参数，权重和恒为1
+        loss_weight = ConstrainedWeight().to(device)
         pg.extend(loss_weight.parameters())
-        logger.info(f"使用自适应损失权重，初始 log_var: {loss_weight.log_var.data}")
+        logger.info(f"使用 ConstrainedWeight 自适应损失权重")
+        logger.info(f"初始权重: Consistency={torch.sigmoid(loss_weight.w).item():.4f}, CE={1-torch.sigmoid(loss_weight.w).item():.4f}")
     else:
         loss_weight = None
         logger.info(f"使用固定权重: Consistency={args.consistency_rate}, CE={1-args.consistency_rate}")
 
-    optimizer = torch.optim.AdamW(pg, lr=args.lr, weight_decay=5E-2)
+    optimizer = torch.optim.AdamW(pg, lr=args.lr, weight_decay=args.weight_decay)
 
-    # Data augmentations
+    # 学习率调度器
+    if args.scheduler == 'cosine':
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer, T_0=10, T_mult=2, eta_min=1e-6
+        )
+        logger.info(f"使用 CosineAnnealingWarmRestarts 调度器, T_0=10, T_mult=2")
+    elif args.scheduler == 'step':
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.5)
+        logger.info(f"使用 StepLR 调度器, step_size=10, gamma=0.5")
+    elif args.scheduler == 'plateau':
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='max', factor=0.5, patience=5, verbose=True
+        )
+        logger.info(f"使用 ReduceLROnPlateau 调度器, patience=5, factor=0.5")
+    else:
+        scheduler = None
+        logger.info("不使用学习率调度器")
+
+    # Data augmentations - 训练集使用随机增强，验证集使用确定性变换
     aug_list = ['base', 'RE', 'DFDC_Selium', 'RA', 'RandCrop']
     trans_name = random.sample(aug_list, 1)[0]
-    transforms = get_aug(name=trans_name, img_size=224)
-    logger.info(f"使用数据增强: {trans_name}")
+    transforms_train = get_aug(name=trans_name, img_size=224)
+    transforms_val = get_aug(name='base', img_size=224)  # 验证集使用基础变换
+    logger.info(f"训练集使用数据增强: {trans_name}")
+    logger.info(f"验证集使用确定性变换: base")
 
     # Define Datasets
     train_files = os.path.join(os.getcwd(), 'txt_files', 'new_train.txt')
     val_files = os.path.join(os.getcwd(), 'txt_files', 'new_test.txt')
 
-    trans_train_set = Deepfake_Dataset(train_files, transform=transforms)
+    trans_train_set = Deepfake_Dataset(train_files, transform=transforms_train)
     train_Loader = DataLoader(dataset=trans_train_set, batch_size=args.batch, shuffle=True)
 
-    trans_val_set = Deepfake_Dataset(val_files, transform=transforms)
-    val_Loader = DataLoader(dataset=trans_val_set, batch_size=args.batch, shuffle=True)
+    trans_val_set = Deepfake_Dataset(val_files, transform=transforms_val)
+    val_Loader = DataLoader(dataset=trans_val_set, batch_size=args.batch, shuffle=False)  # 验证集shuffle=False
 
     logger.info(f"训练集大小: {len(trans_train_set)}, 验证集大小: {len(trans_val_set)}")
     logger.info(f"Batch size: {args.batch}, Epochs: {args.epochs}")
 
     best_acc = 0.0
     best_auc = 0.0
+    patience = 10  # 早停耐心值
+    patience_counter = 0  # 早停计数器
+    best_epoch = 0
 
     # Model Training:
     for epoch in range(args.epochs):
@@ -247,7 +274,7 @@ if __name__ == '__main__':
             # 使用自适应权重或固定权重
             if args.adaptive_weight and loss_weight is not None:
                 total_loss, weights = loss_weight([L_con, ce_loss])
-                weight_con, weight_ce = weights[0], weights[1]
+                weight_con, weight_ce = weights[0], weights[1]  # weights已经是list
             else:
                 total_loss = args.consistency_rate * L_con + (1 - args.consistency_rate) * ce_loss
                 weight_con, weight_ce = args.consistency_rate, 1 - args.consistency_rate
@@ -257,14 +284,6 @@ if __name__ == '__main__':
 
             optimizer.step()
             optimizer.zero_grad()
-
-            # 每 10 步记录一次
-            if (step + 1) % 10 == 0:
-                current_loss = accu_loss.item() / (step + 1)
-                current_acc = accu_num.item() / sample_num
-                logger.info(f"[Epoch {epoch+1} Step {step+1}/{len(train_Loader)}] "
-                           f"Loss: {current_loss:.4f}, Video Acc: {current_acc:.4f}, "  # 明确标注Video Acc
-                           f"L_con: {L_con.item():.4f}, L_ce: {ce_loss.item():.4f}")
 
         # 计算训练集 AUC
         train_auc = roc_auc_score(all_train_labels, all_train_probs) if len(set(all_train_labels)) > 1 else 0.0
@@ -276,7 +295,22 @@ if __name__ == '__main__':
         logger.info(f"  Video Accuracy: {train_acc:.4f}")  # 明确标注Video Accuracy
         logger.info(f"  Video AUC: {train_auc:.4f}")  # 明确是视频级AUC
         if args.adaptive_weight:
-            logger.info(f"  Weights - Consistency: {weight_con:.4f}, CE: {weight_ce:.4f}")
+            logger.info(f"  Weights - Consistency: {weight_con:.4f}, CE: {weight_ce:.4f}, Sum: {weight_con + weight_ce:.4f}")
+            if loss_weight is not None:
+                w_con = torch.sigmoid(loss_weight.w).item()
+                w_ce = 1 - w_con
+                logger.info(f"  Current w parameter: {loss_weight.w.item():.4f}, sigmoid: {w_con:.4f}, CE weight: {w_ce:.4f}")
+
+        # 更新学习率调度器
+        current_lr = optimizer.param_groups[0]['lr']
+        if scheduler is not None:
+            if args.scheduler == 'plateau':
+                scheduler.step(val_auc if epoch > 0 else 0)  # ReduceLROnPlateau需要传入指标
+            else:
+                scheduler.step()
+            new_lr = optimizer.param_groups[0]['lr']
+            if new_lr != current_lr:
+                logger.info(f"  Learning rate changed: {current_lr:.6f} -> {new_lr:.6f}")
 
         # Validating
         model.eval()
@@ -323,13 +357,6 @@ if __name__ == '__main__':
                 loss = loss_function(pred_flat, label_flat)
                 accu_loss += loss
 
-                # 每 10 步记录一次
-                if (step + 1) % 10 == 0:
-                    current_loss = accu_loss.item() / (step + 1)
-                    current_acc = accu_num.item() / sample_num
-                    logger.info(f"  [Step {step+1}/{len(val_Loader)}] "
-                               f"Loss: {current_loss:.4f}, Video Acc: {current_acc:.4f}")  # 明确标注Video Acc
-
             # 计算验证集指标
             val_loss = accu_loss.item() / len(val_Loader)
             val_acc = accu_num.item() / sample_num
@@ -368,7 +395,10 @@ if __name__ == '__main__':
                         'auc': val_auc,
                         'args': args
                     }, './checkpoints/Swin_face_v2.pth')
-                    logger.info(f"自适应权重 - Consistency: {weight_con:.4f}, CE: {weight_ce:.4f}")
+                    w_con = torch.sigmoid(loss_weight.w).item()
+                    w_ce = 1 - w_con
+                    logger.info(f"当前自适应权重 - Consistency: {w_con:.4f}, CE: {w_ce:.4f}, 权重和: {w_con + w_ce:.4f}")
+                    logger.info(f"当前原始参数 w: {loss_weight.w.item():.4f} (sigmoid后: {w_con:.4f})")
                 else:
                     torch.save({
                         'model': model.state_dict(),
@@ -378,6 +408,21 @@ if __name__ == '__main__':
                         'args': args
                     }, './checkpoints/Swin_face_v2.pth')
                 logger.info(f"{'='*60}\n")
+
+                # 重置早停计数器
+                patience_counter = 0
+                best_epoch = epoch + 1
+            else:
+                patience_counter += 1
+                logger.info(f"  No improvement. Early stopping patience: {patience_counter}/{patience}")
+
+            # 早停检查
+            if patience_counter >= patience:
+                logger.info(f"\n{'='*60}")
+                logger.info(f"Early stopping triggered at epoch {epoch+1}")
+                logger.info(f"Best epoch: {best_epoch}")
+                logger.info(f"{'='*60}")
+                break
 
     logger.info(f"\n{'='*60}")
     logger.info("Training Completed!")

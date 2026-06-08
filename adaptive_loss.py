@@ -116,6 +116,35 @@ class GradNormWeight(nn.Module):
         return total_loss, weights.tolist()
 
 
+class ConstrainedWeight(nn.Module):
+    """
+    约束权重模块：权重和恒为1，只有一个可学习参数
+    通过 sigmoid 将参数约束在 (0,1)，自动计算第二个权重为 1-w
+    """
+    def __init__(self):
+        super(ConstrainedWeight, self).__init__()
+        # 只学习一个参数，范围通过 sigmoid 约束在 (0, 1)
+        self.w = nn.Parameter(torch.tensor(0.5))  # 初始值为0.5
+
+    def forward(self, losses):
+        """
+        Args:
+            losses: list of losses [L_con, L_ce]
+
+        Returns:
+            weighted_loss: 加权后的总损失
+            weights: [w_con, w_ce] 权重列表
+        """
+        # 使用 sigmoid 将参数约束在 (0, 1)
+        w_con = torch.sigmoid(self.w)
+        w_ce = 1 - w_con  # 保证权重和为1
+
+        # 计算加权损失
+        total_loss = w_con * losses[0] + w_ce * losses[1]
+
+        return total_loss, [w_con.item(), w_ce.item()]
+
+
 # 使用示例
 if __name__ == '__main__':
     # 创建可学习权重模块
